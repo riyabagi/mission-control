@@ -1,0 +1,38 @@
+# Go
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+vendor/
+**/vendor/
+*.test
+
+# Node/Vite/React
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+.vite/
+
+# Docker
+docker-compose.override.yml
+**/.env
+**/.dockerignore
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# go mod cache
+Gopkg.lock
