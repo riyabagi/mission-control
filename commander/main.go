@@ -7,14 +7,14 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 	"sort"
+	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/gin-contrib/cors"
-	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/google/uuid"
+	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 var (
@@ -87,10 +87,29 @@ func main() {
 
 	// Enable CORS
 	router.Use(cors.Default())
-	
+
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Commander API is running",
+			"endpoints": []string{
+				"POST /missions",
+				"GET /missions/:id",
+				"GET /missions",
+			},
+		})
+	})
+
 	router.POST("/missions", createMissionHandler)
 	router.GET("/missions/:id", getMissionHandler)
 	router.GET("/missions", listMissionsHandler)
+
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"redis": redisCli.Ping(ctx).Err() == nil,
+			"rabbitmq": amqpConn != nil,
+		})
+	})
 
 	// Token issue endpoint (requires bootstrap secret)
 	router.POST("/token/issue", issueTokenHandler)
@@ -189,25 +208,24 @@ func getMissionHandler(c *gin.Context) {
 }
 
 func listMissionsHandler(c *gin.Context) {
-    iter := redisCli.Scan(ctx, 0, "mission:*", 100).Iterator()
-    missions := []Mission{}
+	iter := redisCli.Scan(ctx, 0, "mission:*", 100).Iterator()
+	missions := []Mission{}
 
-    for iter.Next(ctx) {
-        val, _ := redisCli.Get(ctx, iter.Val()).Result()
-        var m Mission
-        if err := json.Unmarshal([]byte(val), &m); err == nil {
-            missions = append(missions, m)
-        }
-    }
+	for iter.Next(ctx) {
+		val, _ := redisCli.Get(ctx, iter.Val()).Result()
+		var m Mission
+		if err := json.Unmarshal([]byte(val), &m); err == nil {
+			missions = append(missions, m)
+		}
+	}
 
-    // Sort by updated_at (latest first)
-    sort.Slice(missions, func(i, j int) bool {
-        return missions[i].UpdatedAt.After(missions[j].UpdatedAt)
-    })
+	// Sort by updated_at (latest first)
+	sort.Slice(missions, func(i, j int) bool {
+		return missions[i].UpdatedAt.After(missions[j].UpdatedAt)
+	})
 
-    c.JSON(http.StatusOK, missions)
+	c.JSON(http.StatusOK, missions)
 }
-
 
 func updateMissionStatus(id, status string) error {
 	key := fmt.Sprintf("mission:%s", id)
