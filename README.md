@@ -209,6 +209,8 @@ Mission Control implements a one-way secure command system:
 - All updates go back through status_queue
 - Commander persists everything in Redis
 
+<img src="images/architecture.png" width="600">
+
 ### Core Components
 1. Commander (Go API)
 
@@ -223,7 +225,8 @@ Responsibilities:
 
 2. Worker Units (Go)
 
-- Responsibilities:
+Responsibilities:
+
 - Poll RabbitMQ for mission IDs
 - Fetch mission details from Redis
 - Execute mission (5–15 sec simulation)
@@ -483,6 +486,9 @@ The Go Commander generates secure, UUID-based tokens.
 6. Worker publishes COMPLETED/FAILED  
 7. Commander updates Redis  
 8. Client polls /missions for updates  
+
+ <img src="images/flowchart.jpeg" width="600">
+
 
 ## Mission Success Rate & Testing Summary
 

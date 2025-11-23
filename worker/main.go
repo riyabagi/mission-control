@@ -47,7 +47,7 @@ func main() {
 	redisAddr := getenv("REDIS_ADDR", "redis:6379")
 	workerID := getenv("WORKER_ID", "soldier-"+uuid.New().String()[:8])
 	bootstrapSecret := getenv("WORKER_BOOTSTRAP_SECRET", "bootstrapsecret")
-	concurrency := getenvInt("WORKER_CONCURRENCY", 4)
+	concurrency := getenvInt("WORKER_CONCURRENCY", 1)
 
 	// Redis (optional, used only as client cache; tokens are validated by commander)
 	_ = redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -105,6 +105,7 @@ func main() {
 			continue
 		}
 		// acquire worker slot
+		// Blocks if the worker is already running the max allowed missions.
 		sem <- struct{}{}
 		go func(ord OrderMsg) {
 			defer func() { <-sem }()

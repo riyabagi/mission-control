@@ -13,7 +13,7 @@ function App() {
   const submitMission = async () => {
     try {
       setLoading(true);
-      const p = payload ? JSON.parse(payload) : { text: "hello" };
+      const p = payload ? JSON.parse(payload) : { text: "Attack" };
 
       const res = await fetch(`${commanderUrl}/missions`, {
         method: "POST",

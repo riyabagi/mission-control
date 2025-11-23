@@ -47,6 +47,7 @@ type StatusMessage struct {
 
 func main() {
 	// Env
+	// Service knows where Redis, RabbitMQ are and which port to listen on.
 	rabbitURL := getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 	redisAddr := getenv("REDIS_ADDR", "redis:6379")
 	port := getenv("COMMANDER_PORT", "8080")
@@ -80,22 +81,15 @@ func main() {
 	}
 	log.Println("Connected to RabbitMQ and declared queues")
 
-	// Start consuming status_queue
+	// Start consumer
 	go consumeStatusQueue()
 
 	router := gin.Default()
-
-	// Enable CORS
 	router.Use(cors.Default())
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Commander API is running",
-			"endpoints": []string{
-				"POST /missions",
-				"GET /missions/:id",
-				"GET /missions",
-			},
 		})
 	})
 
@@ -105,21 +99,42 @@ func main() {
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-			"redis": redisCli.Ping(ctx).Err() == nil,
-			"rabbitmq": amqpConn != nil,
+			"status":  "ok",
+			"redis":   redisCli.Ping(ctx).Err() == nil,
+			"rabbit":  amqpConn != nil,
 		})
 	})
 
-	// Token issue endpoint (requires bootstrap secret)
+	// Token issue endpoint
 	router.POST("/token/issue", issueTokenHandler)
 
-	// Admin endpoints (basic auth) to list tokens (for demo)
+	// Admin-only token list
 	admin := router.Group("/admin", gin.BasicAuth(gin.Accounts{adminUser: adminPass}))
 	admin.GET("/tokens", listTokensHandler)
 
 	log.Printf("Commander listening on :%s", port)
 	router.Run(":" + port)
+}
+
+// validateToken checks if token exists and belongs to given soldier ID.
+func validateToken(token string, soldierID string) bool {
+	if token == "" || soldierID == "" {
+		return false
+	}
+
+	key := fmt.Sprintf("token:%s", token)
+	owner, err := redisCli.Get(ctx, key).Result()
+	if err != nil {
+		log.Printf("token validation failed: %v", err)
+		return false
+	}
+
+	if owner != soldierID {
+		log.Printf("token mismatch: owner=%s, soldier=%s", owner, soldierID)
+		return false
+	}
+
+	return true
 }
 
 func consumeStatusQueue() {
@@ -130,24 +145,18 @@ func consumeStatusQueue() {
 	log.Println("Started consuming status_queue")
 	for d := range msgs {
 		var s StatusMessage
-		// Convert JSON into Go struct
+
 		if err := json.Unmarshal(d.Body, &s); err != nil {
 			log.Printf("invalid status message: %v", err)
 			continue
 		}
-		// Validate token
-		key := fmt.Sprintf("token:%s", s.Token)
-		val, err := redisCli.Get(ctx, key).Result()
-		if err != nil {
-			log.Printf("token validation failed for token=%s : %v", s.Token, err)
+
+		// Use the new validateToken function
+		if !validateToken(s.Token, s.SoldierID) {
+			log.Printf("invalid token from soldier %s", s.SoldierID)
 			continue
 		}
-		// val = soldier_id (as saved)
-		if val != s.SoldierID {
-			log.Printf("token mismatch soldier: token owner=%s message soldier=%s", val, s.SoldierID)
-			continue
-		}
-		// Token valid - update mission status
+
 		if err := updateMissionStatus(s.MissionID, s.Status); err != nil {
 			log.Printf("failed update mission status: %v", err)
 		} else {
@@ -166,7 +175,7 @@ func createMissionHandler(c *gin.Context) {
 	m := &Mission{
 		ID:        id,
 		Payload:   payload,
-		Status:    "QUEUED",
+		Status:    "QUEUED", 
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -175,7 +184,7 @@ func createMissionHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed store mission"})
 		return
 	}
-	// publish to orders_queue
+
 	orderMsg := map[string]any{"mission_id": id, "payload": payload, "ts": time.Now().Unix()}
 	body, _ := json.Marshal(orderMsg)
 	if err := amqpCh.Publish("", ordersQ.Name, false, false, amqp.Publishing{
@@ -219,7 +228,6 @@ func listMissionsHandler(c *gin.Context) {
 		}
 	}
 
-	// Sort by updated_at (latest first)
 	sort.Slice(missions, func(i, j int) bool {
 		return missions[i].UpdatedAt.After(missions[j].UpdatedAt)
 	})
@@ -243,41 +251,45 @@ func updateMissionStatus(id, status string) error {
 	return redisCli.Set(ctx, key, bs, 0).Err()
 }
 
-// Token issuance handler (worker calls this with bootstrap secret)
 func issueTokenHandler(c *gin.Context) {
 	var req struct {
 		SoldierID string `json:"soldier_id"`
 		Secret    string `json:"secret"`
 	}
+
 	if err := c.ShouldBindJSON(&req); err != nil || req.SoldierID == "" || req.Secret == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
 		return
 	}
+
 	expected := getenv("WORKER_BOOTSTRAP_SECRET", "bootstrapsecret")
 	if req.Secret != expected {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid secret"})
 		return
 	}
+
 	token := uuid.New().String()
 	ttlSecs := getenvInt("TOKEN_TTL_SECS", 30)
 	key := fmt.Sprintf("token:%s", token)
+
 	if err := redisCli.Set(ctx, key, req.SoldierID, time.Duration(ttlSecs)*time.Second).Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed store token"})
 		return
 	}
-	// store reverse mapping to inspect tokens (optional)
+
 	meta := map[string]any{
 		"token":      token,
 		"soldier_id": req.SoldierID,
 		"issued_at":  time.Now().Unix(),
 		"ttl":        ttlSecs,
 	}
+
 	_ = redisCli.Set(ctx, "tokenmeta:"+token, toJson(meta), time.Duration(ttlSecs)*time.Second).Err()
+
 	c.JSON(http.StatusOK, gin.H{"token": token, "ttl_secs": ttlSecs})
 }
 
 func listTokensHandler(c *gin.Context) {
-	// For demo: list tokenmeta:* keys
 	iter := redisCli.Scan(ctx, 0, "tokenmeta:*", 100).Iterator()
 	list := []map[string]any{}
 	for iter.Next(ctx) {
@@ -289,7 +301,6 @@ func listTokensHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, list)
 }
 
-// helpers
 func getenv(k, d string) string {
 	v := os.Getenv(k)
 	if v == "" {
@@ -297,6 +308,7 @@ func getenv(k, d string) string {
 	}
 	return v
 }
+
 func getenvInt(k string, d int) int {
 	v := os.Getenv(k)
 	if v == "" {
@@ -309,6 +321,7 @@ func getenvInt(k string, d int) int {
 	}
 	return i
 }
+
 func toJson(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)

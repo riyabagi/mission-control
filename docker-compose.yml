@@ -68,7 +68,7 @@ services:
       REDIS_ADDR: redis:6379
       WORKER_BOOTSTRAP_SECRET: bootstrapsecret
       WORKER_ID: "soldier-2"
-      WORKER_CONCURRENCY: "3"
+      WORKER_CONCURRENCY: "1"
 
   frontend:
     build: ./frontend
