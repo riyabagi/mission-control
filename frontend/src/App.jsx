@@ -144,7 +144,8 @@ function App() {
                     </p>
 
                     <p><strong>Created:</strong> {new Date(statusResult.created_at).toLocaleString()}</p>
-                    <p><strong>Updated:</strong> {new Date(statusResult.updated_at).toLocaleString()}</p>
+                    <p><strong>In Progress:</strong> {statusResult.in_progress_at ? new Date(statusResult.in_progress_at).toLocaleString() : "N/A"}</p>
+                    <p><strong>Completed:</strong> {new Date(statusResult.updated_at).toLocaleString()}</p>
 
                     <h6 className="mt-3">Payload:</h6>
                     <pre className="bg-light p-3 rounded border">

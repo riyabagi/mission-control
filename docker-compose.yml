@@ -51,7 +51,7 @@ services:
       REDIS_ADDR: redis:6379
       WORKER_BOOTSTRAP_SECRET: bootstrapsecret
       WORKER_ID: "soldier-1"
-      WORKER_CONCURRENCY: "3"
+      WORKER_CONCURRENCY: "2"
 
   worker2:
     build: ./worker
@@ -68,7 +68,24 @@ services:
       REDIS_ADDR: redis:6379
       WORKER_BOOTSTRAP_SECRET: bootstrapsecret
       WORKER_ID: "soldier-2"
-      WORKER_CONCURRENCY: "1"
+      WORKER_CONCURRENCY: "2"
+
+  worker3:
+    build: ./worker
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      commander:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      COMMANDER_URL: http://commander:8080
+      REDIS_ADDR: redis:6379
+      WORKER_BOOTSTRAP_SECRET: bootstrapsecret
+      WORKER_ID: "soldier-3"
+      WORKER_CONCURRENCY: "2"
 
   frontend:
     build: ./frontend

@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+    "encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -15,6 +21,14 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"golang.org/x/crypto/argon2"
+)
+
+const (
+	argonTime    = 1        // iterations
+	argonMemory  = 64 * 1024 // 64 MB
+	argonThreads = 4
+	argonKeyLen  = 32
 )
 
 var (
@@ -34,6 +48,7 @@ type Mission struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	InProgressAt *time.Time `json:"in_progress_at,omitempty"`
 }
 
 type StatusMessage struct {
@@ -43,6 +58,16 @@ type StatusMessage struct {
 	Token     string `json:"token"`
 	Detail    string `json:"detail,omitempty"`
 	Ts        int64  `json:"ts"`
+}
+
+type TokenIssueRequest struct {
+	SoldierID string `json:"soldier_id"`
+	Secret    string `json:"secret"`
+}
+
+type TokenIssueResponse struct {
+	Token   string `json:"token"`
+	TtlSecs int    `json:"ttl_secs"`
 }
 
 func main() {
@@ -116,25 +141,110 @@ func main() {
 	router.Run(":" + port)
 }
 
-// validateToken checks if token exists and belongs to given soldier ID.
-func validateToken(token string, soldierID string) bool {
-	if token == "" || soldierID == "" {
-		return false
+func hashSecret(secret string) string {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		log.Fatalf("failed to generate salt: %v", err)
 	}
 
-	key := fmt.Sprintf("token:%s", token)
-	owner, err := redisCli.Get(ctx, key).Result()
+	hash := argon2.IDKey([]byte(secret), salt, 1, 64*1024, 4, 32)
+
+	final := append(salt, hash...)
+	return base64.RawStdEncoding.EncodeToString(final)
+}
+
+func verifySecret(secret, encodedHash string) bool {
+	data, err := base64.RawStdEncoding.DecodeString(encodedHash)
 	if err != nil {
-		log.Printf("token validation failed: %v", err)
+		return false
+	}
+	if len(data) < 48 {
 		return false
 	}
 
-	if owner != soldierID {
-		log.Printf("token mismatch: owner=%s, soldier=%s", owner, soldierID)
+	salt := data[:16]
+	storedHash := data[16:]
+
+	newHash := argon2.IDKey([]byte(secret), salt, 1, 64*1024, 4, 32)
+
+	return subtleCompare(newHash, storedHash)
+}
+
+func subtleCompare(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var res byte
+	for i := range a {
+		res |= a[i] ^ b[i]
+	}
+	return res == 0
+}
+
+func verifyBootstrapSecret(given string) bool {
+	envSecret := getenv("WORKER_BOOTSTRAP_SECRET", "bootstrapsecret")
+
+	// hash once at startup
+	expectedHash := hashSecret(envSecret)
+
+	// check input
+	return verifySecret(given, expectedHash)
+}
+
+func hashTokenSHA256(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// validateToken checks if token exists and belongs to given soldier ID.
+func validateToken(token, soldierID string) bool {
+	key := "token:" + soldierID
+
+	storedHash, err := redisCli.Get(ctx, key).Result()
+	if err != nil {
 		return false
 	}
 
-	return true
+	incomingHash := hashTokenSHA256(token)
+
+	return subtle.ConstantTimeCompare([]byte(storedHash), []byte(incomingHash)) == 1
+}
+
+func issueTokenHandler(c *gin.Context) {
+	var req TokenIssueRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	if req.SoldierID == "" || req.Secret == "" {
+		c.JSON(400, gin.H{"error": "missing fields"})
+		return
+	}
+
+	// Validate bootstrap secret
+	if !verifyBootstrapSecret(req.Secret) {
+		c.JSON(401, gin.H{"error": "invalid secret"})
+		return
+	}
+
+	// Generate new token
+	rawToken := uuid.New().String()
+	hashed := hashTokenSHA256(rawToken)
+
+	ttl := 30 * time.Second
+	key := "token:" + req.SoldierID
+
+	err := redisCli.Set(ctx, key, hashed, ttl).Err()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "redis fail"})
+		return
+	}
+
+	c.JSON(200, TokenIssueResponse{
+		Token:   rawToken,
+		TtlSecs: int(ttl.Seconds()),
+	})
 }
 
 func consumeStatusQueue() {
@@ -143,21 +253,21 @@ func consumeStatusQueue() {
 		log.Fatalf("consume status queue: %v", err)
 	}
 	log.Println("Started consuming status_queue")
+
 	for d := range msgs {
 		var s StatusMessage
-
 		if err := json.Unmarshal(d.Body, &s); err != nil {
 			log.Printf("invalid status message: %v", err)
 			continue
 		}
 
-		// Use the new validateToken function
+		// Use the validateToken function
 		if !validateToken(s.Token, s.SoldierID) {
 			log.Printf("invalid token from soldier %s", s.SoldierID)
 			continue
 		}
 
-		if err := updateMissionStatus(s.MissionID, s.Status); err != nil {
+		if err := updateMissionStatus(s.MissionID, s.Status, s.Ts); err != nil {
 			log.Printf("failed update mission status: %v", err)
 		} else {
 			log.Printf("Mission %s updated to %s by %s", s.MissionID, s.Status, s.SoldierID)
@@ -168,52 +278,43 @@ func consumeStatusQueue() {
 func createMissionHandler(c *gin.Context) {
 	var payload any
 	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		c.JSON(400, gin.H{"error": "invalid json"})
 		return
 	}
+
 	id := uuid.New().String()
-	m := &Mission{
+	m := Mission{
 		ID:        id,
 		Payload:   payload,
-		Status:    "QUEUED", 
+		Status:    "QUEUED",
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	bs, _ := json.Marshal(m)
-	if err := redisCli.Set(ctx, fmt.Sprintf("mission:%s", id), bs, 0).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed store mission"})
-		return
-	}
 
-	orderMsg := map[string]any{"mission_id": id, "payload": payload, "ts": time.Now().Unix()}
-	body, _ := json.Marshal(orderMsg)
-	if err := amqpCh.Publish("", ordersQ.Name, false, false, amqp.Publishing{
+	bs, _ := json.Marshal(m)
+	redisCli.Set(ctx, "mission:"+id, bs, 0)
+
+	order := map[string]any{"mission_id": id, "payload": payload, "ts": time.Now().Unix()}
+	body, _ := json.Marshal(order)
+
+	amqpCh.Publish("", ordersQ.Name, false, false, amqp.Publishing{
 		ContentType: "application/json",
 		Body:        body,
-	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed publish order"})
-		return
-	}
-	c.JSON(http.StatusAccepted, gin.H{"mission_id": id, "status": "QUEUED"})
+	})
+
+	c.JSON(202, gin.H{"mission_id": id, "status": "QUEUED"})
 }
 
 func getMissionHandler(c *gin.Context) {
-	id := c.Param("id")
-	key := fmt.Sprintf("mission:%s", id)
+	key := "mission:" + c.Param("id")
 	val, err := redisCli.Get(ctx, key).Result()
 	if err == redis.Nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "mission not found"})
-		return
-	} else if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "redis error"})
+		c.JSON(404, gin.H{"error": "mission not found"})
 		return
 	}
 	var m Mission
-	if err := json.Unmarshal([]byte(val), &m); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "unmarshal error"})
-		return
-	}
-	c.JSON(http.StatusOK, m)
+	json.Unmarshal([]byte(val), &m)
+	c.JSON(200, m)
 }
 
 func listMissionsHandler(c *gin.Context) {
@@ -235,70 +336,52 @@ func listMissionsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, missions)
 }
 
-func updateMissionStatus(id, status string) error {
-	key := fmt.Sprintf("mission:%s", id)
+func updateMissionStatus(id, status string, ts int64) error {
+	key := "mission:" + id
 	val, err := redisCli.Get(ctx, key).Result()
 	if err != nil {
 		return err
 	}
+
 	var m Mission
 	if err := json.Unmarshal([]byte(val), &m); err != nil {
 		return err
 	}
+
+	t := time.Now()
+	if ts > 0 {
+		t = time.Unix(ts, 0)
+	}
+
 	m.Status = status
-	m.UpdatedAt = time.Now()
+	m.UpdatedAt = t
+
+	if status == "IN_PROGRESS" && m.InProgressAt == nil {
+		m.InProgressAt = &t
+	}
+
 	bs, _ := json.Marshal(m)
 	return redisCli.Set(ctx, key, bs, 0).Err()
 }
 
-func issueTokenHandler(c *gin.Context) {
-	var req struct {
-		SoldierID string `json:"soldier_id"`
-		Secret    string `json:"secret"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil || req.SoldierID == "" || req.Secret == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
-		return
-	}
-
-	expected := getenv("WORKER_BOOTSTRAP_SECRET", "bootstrapsecret")
-	if req.Secret != expected {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid secret"})
-		return
-	}
-
-	token := uuid.New().String()
-	ttlSecs := getenvInt("TOKEN_TTL_SECS", 30)
-	key := fmt.Sprintf("token:%s", token)
-
-	if err := redisCli.Set(ctx, key, req.SoldierID, time.Duration(ttlSecs)*time.Second).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed store token"})
-		return
-	}
-
-	meta := map[string]any{
-		"token":      token,
-		"soldier_id": req.SoldierID,
-		"issued_at":  time.Now().Unix(),
-		"ttl":        ttlSecs,
-	}
-
-	_ = redisCli.Set(ctx, "tokenmeta:"+token, toJson(meta), time.Duration(ttlSecs)*time.Second).Err()
-
-	c.JSON(http.StatusOK, gin.H{"token": token, "ttl_secs": ttlSecs})
-}
-
 func listTokensHandler(c *gin.Context) {
-	iter := redisCli.Scan(ctx, 0, "tokenmeta:*", 100).Iterator()
+	iter := redisCli.Scan(ctx, 0, "token:*", 100).Iterator()
 	list := []map[string]any{}
+
 	for iter.Next(ctx) {
-		v, _ := redisCli.Get(ctx, iter.Val()).Result()
-		var m map[string]any
-		_ = json.Unmarshal([]byte(v), &m)
-		list = append(list, m)
+		key := iter.Val()
+		soldier := strings.TrimPrefix(key, "token:")
+		hash, _ := redisCli.Get(ctx, key).Result()
+		ttl, _ := redisCli.TTL(ctx, key).Result()
+
+		list = append(list, map[string]any{
+			"soldier_id": soldier,
+			"token_hash": hash,
+			"ttl_secs":   int(ttl.Seconds()),
+		})
 	}
-	c.JSON(http.StatusOK, list)
+
+	c.JSON(200, list)
 }
 
 func getenv(k, d string) string {
