@@ -1,14 +1,16 @@
+version: "3.9"
+
 services:
+
   rabbitmq:
     image: rabbitmq:3-management
     hostname: rabbitmq
     ports:
-      - "15672:15672"
-      - "5672:5672"
+      - "15672:15672"     # Management UI
+      - "5672:5672"       # RabbitMQ AMQP
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-
     healthcheck:
       test: ["CMD", "rabbitmqctl", "status"]
       interval: 10s
@@ -22,6 +24,8 @@ services:
 
   commander:
     build: ./commander
+    ports:
+      - "8080:8080"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -29,12 +33,10 @@ services:
         condition: service_started
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_ADDR: redis:6379  # Connect to Redis container via internal DNS.
-      WORKER_BOOTSTRAP_SECRET: bootstrapsecret # Password needed by workers to request tokens.
-      TOKEN_TTL_SECS: "30" # Token lifespan
+      REDIS_ADDR: redis:6379
+      WORKER_BOOTSTRAP_SECRET: bootstrapsecret
+      TOKEN_TTL_SECS: "30"
       COMMANDER_PORT: "8080"
-    ports:
-      - "8080:8080"
 
   worker1:
     build: ./worker
@@ -95,4 +97,4 @@ services:
     ports:
       - "3000:80"
     environment:
-      - REACT_APP_COMMANDER_URL=http://localhost:8080
+      - VITE_COMMANDER_URL=http://localhost:8080

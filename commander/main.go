@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-    "encoding/hex"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	argonTime    = 1        // iterations
-	argonMemory  = 64 * 1024 // 64 MB
+	argonTime    = 1          // iterations
+	argonMemory  = 64 * 1024  // 64 MB
 	argonThreads = 4
 	argonKeyLen  = 32
 )
@@ -43,12 +43,14 @@ var (
 )
 
 type Mission struct {
-	ID        string    `json:"id"`
-	Payload   any       `json:"payload"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string     `json:"id"`
+	Payload      any        `json:"payload"`
+	Status       string     `json:"status"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 	InProgressAt *time.Time `json:"in_progress_at,omitempty"`
+	AssignedTo   string     `json:"assigned_to"`
+	CommanderID  string     `json:"commander_id"`
 }
 
 type StatusMessage struct {
@@ -58,6 +60,12 @@ type StatusMessage struct {
 	Token     string `json:"token"`
 	Detail    string `json:"detail,omitempty"`
 	Ts        int64  `json:"ts"`
+}
+
+type OrderMsg struct {
+	MissionID string      `json:"mission_id"`
+	Payload   interface{} `json:"payload"`
+	Ts        int64       `json:"ts"`
 }
 
 type TokenIssueRequest struct {
@@ -72,7 +80,6 @@ type TokenIssueResponse struct {
 
 func main() {
 	// Env
-	// Service knows where Redis, RabbitMQ are and which port to listen on.
 	rabbitURL := getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 	redisAddr := getenv("REDIS_ADDR", "redis:6379")
 	port := getenv("COMMANDER_PORT", "8080")
@@ -81,6 +88,7 @@ func main() {
 	redisCli = redis.NewClient(&redis.Options{
 		Addr: redisAddr,
 	})
+
 	if err := redisCli.Ping(ctx).Err(); err != nil {
 		log.Fatalf("redis ping failed: %v", err)
 	}
@@ -92,19 +100,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to connect to rabbitmq: %v", err)
 	}
+
 	amqpCh, err = amqpConn.Channel()
 	if err != nil {
 		log.Fatalf("failed to open amqp channel: %v", err)
 	}
+
 	ordersQ, err = amqpCh.QueueDeclare("orders_queue", true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("declare orders_queue: %v", err)
 	}
+
 	statusQ, err = amqpCh.QueueDeclare("status_queue", true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("declare status_queue: %v", err)
 	}
+
 	log.Println("Connected to RabbitMQ and declared queues")
+
+	// Direct exchange for targeted missions
+	err = amqpCh.ExchangeDeclare(
+		"mission_direct",
+		"direct",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+
+	if err != nil {
+		log.Fatalf("failed to declare direct exchange: %v", err)
+	}
 
 	// Start consumer
 	go consumeStatusQueue()
@@ -113,9 +140,7 @@ func main() {
 	router.Use(cors.Default())
 
 	router.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Commander API is running",
-		})
+		c.JSON(http.StatusOK, gin.H{"message": "Commander API is running"})
 	})
 
 	router.POST("/missions", createMissionHandler)
@@ -124,9 +149,9 @@ func main() {
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status":  "ok",
-			"redis":   redisCli.Ping(ctx).Err() == nil,
-			"rabbit":  amqpConn != nil,
+			"status": "ok",
+			"redis":  redisCli.Ping(ctx).Err() == nil,
+			"rabbit": amqpConn != nil,
 		})
 	})
 
@@ -143,28 +168,25 @@ func main() {
 
 func hashSecret(secret string) string {
 	salt := make([]byte, 16)
+
 	if _, err := rand.Read(salt); err != nil {
 		log.Fatalf("failed to generate salt: %v", err)
 	}
 
 	hash := argon2.IDKey([]byte(secret), salt, 1, 64*1024, 4, 32)
-
 	final := append(salt, hash...)
+
 	return base64.RawStdEncoding.EncodeToString(final)
 }
 
 func verifySecret(secret, encodedHash string) bool {
 	data, err := base64.RawStdEncoding.DecodeString(encodedHash)
-	if err != nil {
-		return false
-	}
-	if len(data) < 48 {
+	if err != nil || len(data) < 48 {
 		return false
 	}
 
 	salt := data[:16]
 	storedHash := data[16:]
-
 	newHash := argon2.IDKey([]byte(secret), salt, 1, 64*1024, 4, 32)
 
 	return subtleCompare(newHash, storedHash)
@@ -174,20 +196,18 @@ func subtleCompare(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	var res byte
 	for i := range a {
 		res |= a[i] ^ b[i]
 	}
+
 	return res == 0
 }
 
 func verifyBootstrapSecret(given string) bool {
 	envSecret := getenv("WORKER_BOOTSTRAP_SECRET", "bootstrapsecret")
-
-	// hash once at startup
 	expectedHash := hashSecret(envSecret)
-
-	// check input
 	return verifySecret(given, expectedHash)
 }
 
@@ -196,7 +216,6 @@ func hashTokenSHA256(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// validateToken checks if token exists and belongs to given soldier ID.
 func validateToken(token, soldierID string) bool {
 	key := "token:" + soldierID
 
@@ -212,6 +231,7 @@ func validateToken(token, soldierID string) bool {
 
 func issueTokenHandler(c *gin.Context) {
 	var req TokenIssueRequest
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
@@ -222,13 +242,11 @@ func issueTokenHandler(c *gin.Context) {
 		return
 	}
 
-	// Validate bootstrap secret
 	if !verifyBootstrapSecret(req.Secret) {
 		c.JSON(401, gin.H{"error": "invalid secret"})
 		return
 	}
 
-	// Generate new token
 	rawToken := uuid.New().String()
 	hashed := hashTokenSHA256(rawToken)
 
@@ -252,16 +270,17 @@ func consumeStatusQueue() {
 	if err != nil {
 		log.Fatalf("consume status queue: %v", err)
 	}
+
 	log.Println("Started consuming status_queue")
 
 	for d := range msgs {
 		var s StatusMessage
+
 		if err := json.Unmarshal(d.Body, &s); err != nil {
 			log.Printf("invalid status message: %v", err)
 			continue
 		}
 
-		// Use the validateToken function
 		if !validateToken(s.Token, s.SoldierID) {
 			log.Printf("invalid token from soldier %s", s.SoldierID)
 			continue
@@ -276,61 +295,122 @@ func consumeStatusQueue() {
 }
 
 func createMissionHandler(c *gin.Context) {
-	var payload any
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(400, gin.H{"error": "invalid json"})
+	var req struct {
+		Target      string      `json:"target"`
+		Payload     interface{} `json:"payload"`
+		CommanderID string      `json:"commander_id"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
 		return
 	}
 
-	id := uuid.New().String()
-	m := Mission{
-		ID:        id,
-		Payload:   payload,
-		Status:    "QUEUED",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+	if req.Target == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "target is required"})
+		return
 	}
 
-	bs, _ := json.Marshal(m)
-	redisCli.Set(ctx, "mission:"+id, bs, 0)
+	if req.CommanderID == "" {
+		req.CommanderID = "commander-1"
+	}
 
-	order := map[string]any{"mission_id": id, "payload": payload, "ts": time.Now().Unix()}
-	body, _ := json.Marshal(order)
+	id := uuid.NewString()
+	now := time.Now().UTC()
 
-	amqpCh.Publish("", ordersQ.Name, false, false, amqp.Publishing{
-		ContentType: "application/json",
-		Body:        body,
-	})
+	m := Mission{
+		ID:          id,
+		Payload:     req.Payload,
+		AssignedTo:  req.Target,
+		Status:      "QUEUED",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		CommanderID: req.CommanderID,
+	}
 
-	c.JSON(202, gin.H{"mission_id": id, "status": "QUEUED"})
+	b, _ := json.Marshal(m)
+
+	if err := redisCli.Set(ctx, "mission:"+id, b, 0).Err(); err != nil {
+		log.Printf("redis set error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "redis error"})
+		return
+	}
+
+	order := OrderMsg{
+		MissionID: id,
+		Payload:   req.Payload,
+		Ts:        now.Unix(),
+	}
+
+	ob, _ := json.Marshal(order)
+
+	err := amqpCh.Publish(
+		"mission_direct",
+		req.Target,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        ob,
+		},
+	)
+
+	if err != nil {
+		log.Printf("publish order error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to publish mission"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"mission_id": id})
 }
 
 func getMissionHandler(c *gin.Context) {
 	key := "mission:" + c.Param("id")
+
 	val, err := redisCli.Get(ctx, key).Result()
 	if err == redis.Nil {
 		c.JSON(404, gin.H{"error": "mission not found"})
 		return
 	}
+
 	var m Mission
 	json.Unmarshal([]byte(val), &m)
+
 	c.JSON(200, m)
 }
 
 func listMissionsHandler(c *gin.Context) {
+	commanderFilter := c.Query("commander_id")
+
 	iter := redisCli.Scan(ctx, 0, "mission:*", 100).Iterator()
 	missions := []Mission{}
 
 	for iter.Next(ctx) {
-		val, _ := redisCli.Get(ctx, iter.Val()).Result()
-		var m Mission
-		if err := json.Unmarshal([]byte(val), &m); err == nil {
-			missions = append(missions, m)
+		val, err := redisCli.Get(ctx, iter.Val()).Result()
+		if err != nil {
+			log.Printf("redis get error: %v", err)
+			continue
 		}
+
+		var m Mission
+		if err := json.Unmarshal([]byte(val), &m); err != nil {
+			log.Printf("unmarshal mission error: %v", err)
+			continue
+		}
+
+		if commanderFilter != "" && m.CommanderID != commanderFilter {
+			continue
+		}
+
+		missions = append(missions, m)
+	}
+
+	if err := iter.Err(); err != nil {
+		log.Printf("redis scan error: %v", err)
 	}
 
 	sort.Slice(missions, func(i, j int) bool {
-		return missions[i].UpdatedAt.After(missions[j].UpdatedAt)
+		return missions[i].CreatedAt.After(missions[j].CreatedAt)
 	})
 
 	c.JSON(http.StatusOK, missions)
@@ -338,6 +418,7 @@ func listMissionsHandler(c *gin.Context) {
 
 func updateMissionStatus(id, status string, ts int64) error {
 	key := "mission:" + id
+
 	val, err := redisCli.Get(ctx, key).Result()
 	if err != nil {
 		return err
@@ -371,6 +452,7 @@ func listTokensHandler(c *gin.Context) {
 	for iter.Next(ctx) {
 		key := iter.Val()
 		soldier := strings.TrimPrefix(key, "token:")
+
 		hash, _ := redisCli.Get(ctx, key).Result()
 		ttl, _ := redisCli.TTL(ctx, key).Result()
 
@@ -397,8 +479,10 @@ func getenvInt(k string, d int) int {
 	if v == "" {
 		return d
 	}
+
 	var i int
 	fmt.Sscanf(v, "%d", &i)
+
 	if i == 0 {
 		return d
 	}
