@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -136,8 +135,8 @@ func main() {
 	// Start consumer
 	go consumeStatusQueue()
 
-	router := gin.Default()
-	router.Use(cors.Default())
+	router := gin.Default()		// Create Gin router with default logger and recovery middleware
+	router.Use(cors.Default())	// Enable CORS so frontend from other origins can access the API
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "Commander API is running"})
@@ -472,24 +471,4 @@ func getenv(k, d string) string {
 		return d
 	}
 	return v
-}
-
-func getenvInt(k string, d int) int {
-	v := os.Getenv(k)
-	if v == "" {
-		return d
-	}
-
-	var i int
-	fmt.Sscanf(v, "%d", &i)
-
-	if i == 0 {
-		return d
-	}
-	return i
-}
-
-func toJson(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }
